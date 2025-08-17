@@ -1,34 +1,24 @@
 """
 ingest.py
 
-Handles repository ingestion:
-- Loads source files (e.g. .py, .md) from the target repo.
-- Splits code/documents into chunks with metadata (file, line numbers).
-- Embeds chunks and persists them to a vector database (e.g. Chroma).
-"""
-"""
-ingest.py
+LangChain-first repository ingestion for the Codebase Q&A RAG app.
 
-Minimal, runnable stub for repository ingestion.
-- Loads source files from a target repo (TODO)
-- Splits code/documents into chunks (TODO)
-- Embeds and persists to a vector DB (TODO)
+- Loads .py/.md files from a target repo using LangChain loaders
+- Splits into code-aware chunks with line-number metadata
+- Embeds with HuggingFaceEmbeddings and persists to Chroma
 
-This version is intentionally dependency-light so it can run without
-LangChain installed. Fill in the TODOs as you wire up the real pipeline.
+Requirements:
+    pip install langchain langchain-community langchain-text-splitters sentence-transformers chromadb
 """
-from __future__ import annotations
-
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import yaml  # type: ignore
 except Exception:  # pragma: no cover
     yaml = None  # Optional, we gracefully fall back to defaults
-
 
 # ----------------------------
 # Logging
@@ -40,7 +30,6 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
-
 
 # ----------------------------
 # Defaults (overridable via config.yaml)
@@ -61,69 +50,140 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "model": {"embedding": "BAAI/bge-small-en"},
 }
 
-
 # ----------------------------
-# Stub data structures (so the file runs without LangChain)
+# Lightweight Doc wrapper
 # ----------------------------
 class Doc:
-    """Lightweight document placeholder.
-
-    Replace with `langchain.schema.Document` or your preferred type later.
-    """
-
     def __init__(self, page_content: str, metadata: Optional[Dict[str, Any]] = None):
         self.page_content = page_content
         self.metadata = metadata or {}
 
-
 # ----------------------------
-# Stub functions (fill these in later)
+# Ingestion steps (LangChain-only)
 # ----------------------------
 
 def load_repo_docs(repo_path: str, file_globs: List[str], exclude_globs: List[str]) -> List[Doc]:
-    """Discover and load files from `repo_path` matching `file_globs`.
+    """Discover and load files from `repo_path` using LangChain's TextLoader."""
+    import fnmatch
+    from langchain_community.document_loaders import TextLoader  # type: ignore
 
-    TODO:
-      - Use a proper loader (e.g., LangChain DirectoryLoader) that returns Documents
-      - Read file contents and attach metadata (path, start/end lines)
-      - Respect `exclude_globs`
-    """
-    logger.info("[INGEST] Scanning repo at %s", repo_path)
-    # Minimal no-op implementation (returns empty list so script runs)
-    # Replace with real loading logic.
-    return []
+    root = Path(repo_path).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"[INGEST] repo_path does not exist: {root}")
+
+    # Gather candidate files
+    candidates: List[Path] = []
+    for g in file_globs:
+        candidates.extend(root.glob(g))
+    candidates = [p for p in set(candidates) if p.is_file()]
+
+    # Filter out excluded paths
+    filtered: List[Path] = []
+    for p in candidates:
+        rel = p.relative_to(root).as_posix()
+        if any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(p.as_posix(), pat) for pat in exclude_globs):
+            continue
+        filtered.append(p)
+
+    logger.info("[INGEST] Found %d files after filtering", len(filtered))
+
+    docs: List[Doc] = []
+    for path in filtered:
+        loader = TextLoader(path.as_posix(), autodetect_encoding=True, encoding=None)
+        for d in loader.load():
+            meta = dict(d.metadata or {})
+            meta["source"] = path.as_posix()
+            # rough whole-file span; chunking will assign precise ranges
+            try:
+                with open(path, "r", encoding=meta.get("encoding", "utf-8"), errors="ignore") as fh:
+                    line_count = sum(1 for _ in fh)
+                meta["loc"] = f"1-{line_count}"
+            except Exception:
+                pass
+            docs.append(Doc(page_content=d.page_content, metadata=meta))
+
+    logger.info("[INGEST] Loaded %d documents", len(docs))
+    return docs
 
 
 def split_docs(docs: List[Doc], chunk_size: int, chunk_overlap: int, language: str = "python") -> List[Doc]:
-    """Split documents into chunks.
+    """Split documents into code-aware chunks and compute accurate line ranges."""
+    from langchain_text_splitters import Language, RecursiveCharacterTextSplitter  # type: ignore
+    from langchain.schema import Document as LCDocument  # type: ignore
 
-    TODO:
-      - Use a code-aware splitter (e.g., LangChain RecursiveCharacterTextSplitter.from_language)
-      - Add line-number metadata to each chunk for later citations
-    """
     logger.info(
         "[INGEST] Splitting %d docs into chunks (size=%d, overlap=%d, lang=%s)",
         len(docs), chunk_size, chunk_overlap, language,
     )
-    # Minimal no-op implementation: return input unchanged
-    return docs
+    if not docs:
+        return []
+
+    # group by file path
+    by_source: Dict[str, List[Doc]] = {}
+    for d in docs:
+        src = d.metadata.get("source", "<unknown>")
+        by_source.setdefault(src, []).append(d)
+
+    # pick language enum
+    try:
+        lang_enum = getattr(Language, language.upper())
+    except Exception:
+        lang_enum = Language.PYTHON
+
+    splitter = RecursiveCharacterTextSplitter.from_language(
+        language=lang_enum,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    out: List[Doc] = []
+    for src, doc_list in by_source.items():
+        original_text = "\n\n".join(d.page_content for d in doc_list)
+        lc_docs = [LCDocument(page_content=original_text, metadata={"source": src})]
+        lc_chunks = splitter.split_documents(lc_docs)
+
+        # map chunks back to line ranges using a moving cursor
+        cursor = 0
+        for ch in lc_chunks:
+            content = ch.page_content
+            idx = original_text.find(content, cursor)
+            if idx == -1:
+                idx = original_text.find(content)
+            if idx == -1:
+                out.append(Doc(page_content=content, metadata={"source": src}))
+                continue
+            start_char = idx
+            end_char = idx + len(content)
+            start_line = original_text.count("\n", 0, start_char) + 1
+            end_line = original_text.count("\n", 0, end_char) + 1
+            out.append(Doc(page_content=content, metadata={"source": src, "loc": f"{start_line}-{end_line}"}))
+            cursor = end_char
+
+    logger.info("[INGEST] Produced %d chunks", len(out))
+    return out
 
 
 def embed_and_persist(chunks: List[Doc], index_path: str, embedding_model: str) -> None:
-    """Embed chunks and persist to a vector database.
+    """Embed chunks with HuggingFaceEmbeddings and persist to Chroma via LangChain."""
+    from langchain_community.vectorstores import Chroma  # type: ignore
+    from langchain.embeddings import HuggingFaceEmbeddings  # type: ignore
 
-    TODO:
-      - Initialize embeddings (e.g., sentence-transformers BAAI/bge-small-en)
-      - Create/persist a vector store (e.g., Chroma with `persist_directory=index_path`)
-      - Upsert chunk embeddings + metadata
-    """
-    # Ensure index directory exists even in stub mode so users see side effects
     Path(index_path).mkdir(parents=True, exist_ok=True)
-    logger.info(
-        "[INGEST] (stub) Would embed %d chunks with '%s' and persist to '%s'",
-        len(chunks), embedding_model, index_path,
-    )
+    texts = [d.page_content for d in chunks]
+    metadatas = [d.metadata for d in chunks]
 
+    logger.info("[INGEST] Using LangChain Chroma with HuggingFaceEmbeddings '%s'", embedding_model)
+    emb = HuggingFaceEmbeddings(model_name=embedding_model)
+
+    # from_texts persists when persist_directory is provided
+    _ = Chroma.from_texts(
+        texts=texts,
+        embedding=emb,
+        metadatas=metadatas,
+        persist_directory=index_path,
+        collection_name="codeqa",
+    )
+    logger.info("[INGEST] Persisted %d chunks to Chroma at %s", len(texts), index_path)
 
 # ----------------------------
 # Orchestration
@@ -143,12 +203,10 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path and Path(config_path).exists() and yaml is not None:
         with open(config_path, "r") as f:
             cfg = yaml.safe_load(f) or {}
-        # Shallow merge on top of defaults
         merged = {**DEFAULT_CONFIG, **cfg}
     else:
         merged = DEFAULT_CONFIG.copy()
 
-    # Normalize some fields to expected types
     merged.setdefault("chunk", {}).setdefault("size", DEFAULT_CONFIG["chunk"]["size"])
     merged.setdefault("chunk", {}).setdefault("overlap", DEFAULT_CONFIG["chunk"]["overlap"])
     merged.setdefault("chunk", {}).setdefault("language", DEFAULT_CONFIG["chunk"]["language"])
@@ -156,11 +214,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 def build_index(config_path: Optional[str] = None) -> None:
-    """End-to-end ingestion: load → split → embed → persist.
-
-    This is a stubbed pipeline that logs each step so you can run it right away.
-    Replace internals with real loaders/splitters/vector stores incrementally.
-    """
+    """End-to-end ingestion: load → split → embed → persist."""
     cfg = load_config(config_path)
     repo_path: str = cfg["repo_path"]
     index_path: str = cfg["index_path"]
@@ -178,7 +232,7 @@ def build_index(config_path: Optional[str] = None) -> None:
     chunks = split_docs(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap, language=language)
     embed_and_persist(chunks, index_path=index_path, embedding_model=embedding_model)
 
-    logger.info("[INGEST] Done. (This was a stub run—replace TODOs to enable real indexing.)")
+    logger.info("[INGEST] Done.")
 
 
 if __name__ == "__main__":

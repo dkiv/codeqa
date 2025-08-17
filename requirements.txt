@@ -1,8 +1,5 @@
-# requirements.txt
-# Python dependencies for the Codebase Q&A assistant.
-# Example:
-# langchain
-# langchain-community
-# langchain-openai
-# chromadb
-# sentence-transformers
+langchain
+langchain-community
+langchain-text-splitters
+chromadb
+sentence-transformers
