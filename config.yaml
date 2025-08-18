@@ -1,2 +1,37 @@
 # config.yaml
 # Central configuration for repo paths, chunking parameters, retrieval settings, and model choices.
+# config.yaml — central configuration for CodeQA RAG
+
+# --- Ingestion settings (used by ingest.py) ---
+repo_path: data/repo
+index_path: data/index
+file_globs:
+  - "**/*.py"
+  - "**/*.md"
+exclude_globs:
+  - "**/.git/**"
+  - "**/__pycache__/**"
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "**/build/**"
+  - "**/.venv/**"
+chunk:
+  size: 800
+  overlap: 120
+  language: python
+model:
+  embedding: BAAI/bge-small-en
+
+# --- Retrieval/answer settings (used by rag_chain.py) ---
+# rag_chain.py will merge these with its DEFAULT_CONFIG
+# (If you omit a key, the default stays in effect.)
+# Ensure this index_path matches the one above.
+index_path: data/index
+model:
+  embedding: BAAI/bge-small-en
+  chat: gpt-4o-mini
+  temperature: 0.0
+retrieval:
+  k: 8
+  max_context_chunks: 6
+  max_chunk_chars: 1200

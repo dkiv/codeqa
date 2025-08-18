@@ -14,6 +14,13 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from langchain_community.vectorstores import Chroma  # type: ignore
+from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+import fnmatch
+from langchain_community.document_loaders import TextLoader  # type: ignore
+from langchain_text_splitters import Language, RecursiveCharacterTextSplitter  # type: ignore
+from langchain.schema import Document as LCDocument  # type: ignore
+
 
 try:
     import yaml  # type: ignore
@@ -64,8 +71,6 @@ class Doc:
 
 def load_repo_docs(repo_path: str, file_globs: List[str], exclude_globs: List[str]) -> List[Doc]:
     """Discover and load files from `repo_path` using LangChain's TextLoader."""
-    import fnmatch
-    from langchain_community.document_loaders import TextLoader  # type: ignore
 
     root = Path(repo_path).resolve()
     if not root.exists():
@@ -108,8 +113,6 @@ def load_repo_docs(repo_path: str, file_globs: List[str], exclude_globs: List[st
 
 def split_docs(docs: List[Doc], chunk_size: int, chunk_overlap: int, language: str = "python") -> List[Doc]:
     """Split documents into code-aware chunks and compute accurate line ranges."""
-    from langchain_text_splitters import Language, RecursiveCharacterTextSplitter  # type: ignore
-    from langchain.schema import Document as LCDocument  # type: ignore
 
     logger.info(
         "[INGEST] Splitting %d docs into chunks (size=%d, overlap=%d, lang=%s)",
@@ -165,8 +168,6 @@ def split_docs(docs: List[Doc], chunk_size: int, chunk_overlap: int, language: s
 
 def embed_and_persist(chunks: List[Doc], index_path: str, embedding_model: str) -> None:
     """Embed chunks with HuggingFaceEmbeddings and persist to Chroma via LangChain."""
-    from langchain_community.vectorstores import Chroma  # type: ignore
-    from langchain.embeddings import HuggingFaceEmbeddings  # type: ignore
 
     Path(index_path).mkdir(parents=True, exist_ok=True)
     texts = [d.page_content for d in chunks]

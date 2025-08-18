@@ -17,15 +17,17 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cost_estimator import count_tokens, estimate_cost_usd, estimate_and_format
+
 try:
     import yaml  # type: ignore
 except Exception:  # pragma: no cover
     yaml = None
 
-from langchain_community.vectorstores import Chroma  # type: ignore
-from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+from langchain_chroma import Chroma  # type: ignore
 # from langchain_openai import ChatOpenAI  # type: ignore
 from langchain.prompts import ChatPromptTemplate
+from langchain_huggingface import HuggingFaceEmbeddings
 
 logger = logging.getLogger("codeqa.rag")
 if not logger.handlers:
@@ -124,7 +126,7 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     max_chunk_chars: int = int(cfg["retrieval"].get("max_chunk_chars", 1200))
 
     retriever = _build_retriever(index_path, embedding_model, k)
-    docs = retriever.get_relevant_documents(question)[:max_context_chunks]
+    docs = retriever.invoke(question)[:max_context_chunks]
     if not docs:
         return "I couldn't find relevant context in the index. Try re-ingesting or broadening your query."
 
@@ -133,6 +135,11 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     full_prompt = f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nContext:\n{context}\n\nAnswer:"
     print("\n--- Copy this into ChatGPT ---\n")
     print(full_prompt)
+
+    # Rough, pre-call estimate (replace model/rates in cost_estimator.py to be accurate)
+    model_name = cfg["model"].get("chat", "gpt-4o-mini")
+    max_output_tokens = 512  # adjust to your cap
+    print(estimate_and_format(full_prompt, model_name, max_output_tokens))
 
     # msg = PROMPT_TMPL.invoke({"question": question, "context": context})
     # llm = _build_llm(chat_model, temperature=temperature)
