@@ -19,13 +19,11 @@ from typing import Any, Dict, List, Optional
 
 from cost_estimator import count_tokens, estimate_cost_usd, estimate_and_format
 
-try:
-    import yaml  # type: ignore
-except Exception:  # pragma: no cover
-    yaml = None
+import yaml  # type: ignore
+
 
 from langchain_chroma import Chroma  # type: ignore
-# from langchain_openai import ChatOpenAI  # type: ignore
+from langchain_openai import ChatOpenAI  # type: ignore
 from langchain.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -48,6 +46,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "k": 8,
         "max_context_chunks": 6,
         "max_chunk_chars": 1200,
+    },
+    "app": {
+        "use_openai_api": False,
     },
 }
 
@@ -105,6 +106,10 @@ def _build_llm(model_name: str, temperature: float = 0.0):
 
     Set OPENAI_API_KEY in your environment. Replace with another provider if needed.
     """
+    if ChatOpenAI is None:
+        raise RuntimeError(
+            "langchain-openai is not installed. Run `pip install langchain-openai` or set app.use_openai_api=false in config.yaml."
+        )
     return ChatOpenAI(model=model_name, temperature=temperature)
 
 
@@ -125,6 +130,8 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     max_context_chunks: int = int(cfg["retrieval"].get("max_context_chunks", 6))
     max_chunk_chars: int = int(cfg["retrieval"].get("max_chunk_chars", 1200))
 
+    use_openai_api: bool = bool(cfg.get("app", {}).get("use_openai_api", False))
+
     retriever = _build_retriever(index_path, embedding_model, k)
     docs = retriever.invoke(question)[:max_context_chunks]
     if not docs:
@@ -141,11 +148,24 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     max_output_tokens = 512  # adjust to your cap
     print(estimate_and_format(full_prompt, model_name, max_output_tokens))
 
-    # msg = PROMPT_TMPL.invoke({"question": question, "context": context})
-    # llm = _build_llm(chat_model, temperature=temperature)
-    # res = llm.invoke(msg.to_messages())
-    # return here since we're in print-and-copy debug mode
-    return ""
+    if not use_openai_api:
+        # print-and-copy debug mode (no API calls)
+        return ""
+
+    # Build and call the LLM
+    msg = PROMPT_TMPL.invoke({"question": question, "context": context})
+    llm = _build_llm(chat_model, temperature=temperature)
+    res = llm.invoke(msg.to_messages())
+
+    # Optional: refine with actual output tokens
+    try:
+        output_tokens = count_tokens(getattr(res, "content", str(res)), model_name)
+        final_cost = estimate_cost_usd(count_tokens(full_prompt, model_name), output_tokens, model_name)
+        print(f"[TokenEstimate] actual_output_tokens={output_tokens} final_cost_usd~{final_cost:.6f}")
+    except Exception:
+        pass
+
+    return getattr(res, "content", str(res))
 
 
 if __name__ == "__main__":

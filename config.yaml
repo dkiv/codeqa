@@ -35,3 +35,10 @@ retrieval:
   k: 8
   max_context_chunks: 6
   max_chunk_chars: 1200
+
+
+# if you want to use OpenAI API for chat model, set this to true
+# (Otherwise, it will just print the prompt and exit.)
+# Note: this requires you to set OPENAI_API_KEY in your environment.
+app:
+  use_openai_api: false
