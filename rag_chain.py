@@ -14,18 +14,20 @@ Requirements:
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from cost_estimator import count_tokens, estimate_cost_usd, estimate_and_format
-
 import yaml  # type: ignore
-
-
-from langchain_chroma import Chroma  # type: ignore
-from langchain_openai import ChatOpenAI  # type: ignore
+from dotenv import find_dotenv, load_dotenv
 from langchain.prompts import ChatPromptTemplate
+from langchain_chroma import Chroma  # type: ignore
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI  # type: ignore
+
+from cost_estimator import count_tokens, estimate_and_format, estimate_cost_usd
+
+load_dotenv(find_dotenv())
 
 logger = logging.getLogger("codeqa.rag")
 if not logger.handlers:
@@ -66,26 +68,74 @@ PROMPT_TMPL = ChatPromptTemplate.from_messages(
 
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load YAML config if available; otherwise return defaults."""
+    """
+    Precedence:
+      1) DEFAULT_CONFIG
+      2) config.yaml (deep-merged)
+      3) environment variables (incl. .env via python-dotenv), which win last
+    """
+    cfg: Dict[str, Any] = DEFAULT_CONFIG.copy()
+
+    # Discover config.yaml if not provided
     if not config_path:
         here = Path(__file__).resolve().parent
         for c in (here / "config.yaml", here.parent / "config.yaml"):
             if c.exists():
                 config_path = str(c)
                 break
+
+    # Load + deep-merge YAML over defaults
     if config_path and Path(config_path).exists() and yaml is not None:
         with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f) or {}
-        merged = {**DEFAULT_CONFIG, **cfg}
-    else:
-        merged = DEFAULT_CONFIG.copy()
-    return merged
+            file_cfg = yaml.safe_load(f) or {}
+
+        def deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+            for k, v in src.items():
+                if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                    deep_merge(dst[k], v)  # type: ignore[index]
+                else:
+                    dst[k] = v
+            return dst
+
+        cfg = deep_merge(cfg, file_cfg)
+
+    # ---- Env overrides (after load_dotenv(find_dotenv()) at top of file) ----
+    getenv = os.getenv
+
+    # Core paths/models
+    cfg["index_path"] = getenv("INDEX_PATH", cfg["index_path"])
+    cfg["model"]["embedding"] = getenv("EMBEDDING_MODEL", cfg["model"]["embedding"])
+    cfg["model"]["chat"] = getenv("CHAT_MODEL", cfg["model"]["chat"])
+    cfg["model"]["temperature"] = float(
+        getenv("CHAT_TEMPERATURE", cfg["model"]["temperature"])
+    )
+
+    # Retrieval knobs (optional envs)
+    cfg.setdefault("retrieval", {})
+    cfg["retrieval"]["k"] = int(getenv("RETRIEVAL_K", cfg["retrieval"].get("k", 8)))
+    cfg["retrieval"]["max_context_chunks"] = int(
+        getenv("MAX_CONTEXT_CHUNKS", cfg["retrieval"].get("max_context_chunks", 6))
+    )
+    cfg["retrieval"]["max_chunk_chars"] = int(
+        getenv("MAX_CHUNK_CHARS", cfg["retrieval"].get("max_chunk_chars", 1200))
+    )
+
+    # App flags
+    cfg.setdefault("app", {})
+    use_api_env = getenv(
+        "APP_USE_OPENAI_API", str(cfg["app"].get("use_openai_api", False))
+    )
+    cfg["app"]["use_openai_api"] = str(use_api_env).lower() in {"1", "true", "yes"}
+
+    return cfg
 
 
 def _build_retriever(index_path: str, embedding_model: str, k: int):
     """Open persisted Chroma and return a retriever. Uses matching embedding model for queries."""
     emb = HuggingFaceEmbeddings(model_name=embedding_model)
-    vs = Chroma(persist_directory=index_path, embedding_function=emb, collection_name="codeqa")
+    vs = Chroma(
+        persist_directory=index_path, embedding_function=emb, collection_name="codeqa"
+    )
     return vs.as_retriever(search_kwargs={"k": k})
 
 
@@ -139,7 +189,9 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
 
     context = _format_context(docs, max_chunk_chars=max_chunk_chars)
     # Debug: print the constructed prompt for copy-paste into ChatGPT web
-    full_prompt = f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nContext:\n{context}\n\nAnswer:"
+    full_prompt = (
+        f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nContext:\n{context}\n\nAnswer:"
+    )
     print("\n--- Copy this into ChatGPT ---\n")
     print(full_prompt)
 
@@ -160,8 +212,12 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     # Optional: refine with actual output tokens
     try:
         output_tokens = count_tokens(getattr(res, "content", str(res)), model_name)
-        final_cost = estimate_cost_usd(count_tokens(full_prompt, model_name), output_tokens, model_name)
-        print(f"[TokenEstimate] actual_output_tokens={output_tokens} final_cost_usd~{final_cost:.6f}")
+        final_cost = estimate_cost_usd(
+            count_tokens(full_prompt, model_name), output_tokens, model_name
+        )
+        print(
+            f"[TokenEstimate] actual_output_tokens={output_tokens} final_cost_usd~{final_cost:.6f}"
+        )
     except Exception:
         pass
 
@@ -170,5 +226,6 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
 
 if __name__ == "__main__":
     import sys
+
     q = " ".join(sys.argv[1:]).strip() or "What does this repo do?"
     print(ask(q))
