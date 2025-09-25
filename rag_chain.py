@@ -26,6 +26,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI  # type: ignore
 
 from cost_estimator import count_tokens, estimate_and_format, estimate_cost_usd
+from privacy import build_request_pseudonymizer, PrivacyConfig  # type: ignore
 
 load_dotenv(find_dotenv())
 
@@ -48,9 +49,27 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "k": 8,
         "max_context_chunks": 6,
         "max_chunk_chars": 1200,
+        "search_type": "similarity",
+        "mmr_fetch_k": 40,
+        "mmr_lambda": 0.5,
     },
     "app": {
         "use_openai_api": False,
+    },
+    "privacy": {
+        "request_time": True,
+        "enable_ner": False,
+        "entity_types": [
+            "PERSON",
+            "ORG",
+            "GPE",
+            "EMAIL",
+            "PHONE",
+            "SSN",
+            "CREDIT_CARD",
+            "DATE",
+            "ADDRESS",
+        ],
     },
 }
 
@@ -130,12 +149,25 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     return cfg
 
 
-def _build_retriever(index_path: str, embedding_model: str, k: int):
-    """Open persisted Chroma and return a retriever. Uses matching embedding model for queries."""
+def _build_retriever(
+    index_path: str,
+    embedding_model: str,
+    k: int,
+    search_type: str = "similarity",
+    mmr_fetch_k: Optional[int] = None,
+    mmr_lambda: float = 0.5,
+):
+    """Open persisted Chroma and return a retriever. Supports MMR to reduce redundancy."""
     emb = HuggingFaceEmbeddings(model_name=embedding_model)
     vs = Chroma(
         persist_directory=index_path, embedding_function=emb, collection_name="codeqa"
     )
+    if search_type == "mmr":
+        kwargs = {"k": k}
+        if mmr_fetch_k is None:
+            mmr_fetch_k = max(10, k * 4)
+        kwargs.update({"fetch_k": mmr_fetch_k, "lambda_multiplier": mmr_lambda})
+        return vs.as_retriever(search_type="mmr", search_kwargs=kwargs)
     return vs.as_retriever(search_kwargs={"k": k})
 
 
@@ -179,18 +211,55 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     k: int = int(cfg["retrieval"].get("k", 8))
     max_context_chunks: int = int(cfg["retrieval"].get("max_context_chunks", 6))
     max_chunk_chars: int = int(cfg["retrieval"].get("max_chunk_chars", 1200))
+    search_type: str = str(cfg["retrieval"].get("search_type", "similarity"))
+    mmr_fetch_k: int = int(cfg["retrieval"].get("mmr_fetch_k", max(10, k * 4)))
+    mmr_lambda: float = float(cfg["retrieval"].get("mmr_lambda", 0.5))
 
     use_openai_api: bool = bool(cfg.get("app", {}).get("use_openai_api", False))
+    privacy_cfg_raw = cfg.get("privacy", {}) or {}
+    privacy_request_time: bool = bool(privacy_cfg_raw.get("request_time", True))
+    privacy_enable_ner: bool = bool(privacy_cfg_raw.get("enable_ner", False))
+    privacy_entity_types = set(privacy_cfg_raw.get("entity_types", []))
 
-    retriever = _build_retriever(index_path, embedding_model, k)
+    retriever = _build_retriever(
+        index_path,
+        embedding_model,
+        k,
+        search_type=search_type,
+        mmr_fetch_k=mmr_fetch_k,
+        mmr_lambda=mmr_lambda,
+    )
     docs = retriever.invoke(question)[:max_context_chunks]
     if not docs:
         return "I couldn't find relevant context in the index. Try re-ingesting or broadening your query."
 
-    context = _format_context(docs, max_chunk_chars=max_chunk_chars)
+    # Build context, optionally scrubbing PII at request time
+    if privacy_request_time:
+        # Build mapping from retrieved texts + question
+        base_texts = [getattr(d, "page_content", "") or "" for d in docs]
+        p = build_request_pseudonymizer(
+            texts=base_texts + [question],
+            enable_ner=privacy_enable_ner,
+            entity_types=privacy_entity_types,
+        )
+        # Scrub question and chunk texts before prompt
+        question_scrubbed = p.apply(question)
+        parts: List[str] = []
+        for d in docs:
+            src = d.metadata.get("source", "?")
+            loc = d.metadata.get("loc", "?")
+            txt = p.apply((d.page_content or "").strip())
+            if len(txt) > max_chunk_chars:
+                txt = txt[: max_chunk_chars - 3] + "..."
+            parts.append(f"[{src}:{loc}]\n{txt}")
+        context = "\n\n".join(parts)
+    else:
+        p = None  # type: ignore
+        question_scrubbed = question
+        context = _format_context(docs, max_chunk_chars=max_chunk_chars)
     # Debug: print the constructed prompt for copy-paste into ChatGPT web
     full_prompt = (
-        f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nContext:\n{context}\n\nAnswer:"
+        f"{SYSTEM_PROMPT}\n\nQuestion: {question_scrubbed}\n\nContext:\n{context}\n\nAnswer:"
     )
     print("\n--- Copy this into ChatGPT ---\n")
     print(full_prompt)
@@ -205,7 +274,7 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
         return ""
 
     # Build and call the LLM
-    msg = PROMPT_TMPL.invoke({"question": question, "context": context})
+    msg = PROMPT_TMPL.invoke({"question": question_scrubbed, "context": context})
     llm = _build_llm(chat_model, temperature=temperature)
     res = llm.invoke(msg.to_messages())
 
@@ -221,7 +290,14 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
     except Exception:
         pass
 
-    return getattr(res, "content", str(res))
+    answer = getattr(res, "content", str(res))
+    # Decode the answer back to original values if pseudonymized
+    if privacy_request_time and p is not None:
+        try:
+            answer = p.decode(answer)
+        except Exception:
+            pass
+    return answer
 
 
 if __name__ == "__main__":
