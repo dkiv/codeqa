@@ -8,6 +8,8 @@ index_path: data/index
 file_globs:
   - "**/*.py"
   - "**/*.md"
+  - "**/*.pdf"
+  - "**/*.docx"
 exclude_globs:
   - "**/.git/**"
   - "**/__pycache__/**"
@@ -35,6 +37,9 @@ retrieval:
   k: 8
   max_context_chunks: 6
   max_chunk_chars: 1200
+  search_type: mmr         # try MMR to reduce redundancy in results
+  mmr_fetch_k: 40
+  mmr_lambda: 0.5
 
 
 # if you want to use OpenAI API for chat model, set this to true
@@ -42,3 +47,14 @@ retrieval:
 # Note: this requires you to set OPENAI_API_KEY in your environment.
 app:
   use_openai_api: false
+
+# --- Privacy (request-time pseudonymization) ---
+privacy:
+  request_time: true         # scrub retrieved context + question before LLM call
+  enable_regex: true         # use regex patterns for structured PII (EMAIL/PHONE/SSN/CREDIT_CARD/DATE/POSTAL_CODE/ADDRESS)
+  enable_ner: true          # if spaCy (and a model) is installed, set true to include PERSON/ORG/GPE
+  entity_types: [PERSON, ORG, GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, POSTAL_CODE, ADDRESS]
+
+# --- Ingest behavior ---
+# If true, remove the existing index directory before rebuilding to avoid duplicates
+reset_index: true

@@ -26,6 +26,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI  # type: ignore
 
 from cost_estimator import count_tokens, estimate_and_format, estimate_cost_usd
+from privacy import build_request_pseudonymizer  # type: ignore
 
 load_dotenv(find_dotenv())
 
@@ -48,17 +49,43 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "k": 8,
         "max_context_chunks": 6,
         "max_chunk_chars": 1200,
+        "search_type": "similarity",
+        "mmr_fetch_k": 40,
+        "mmr_lambda": 0.5,
     },
     "app": {
         "use_openai_api": False,
     },
+    "privacy": {
+        "request_time": True,
+        "enable_regex": True,
+        "enable_ner": False,
+        "entity_types": [
+            "PERSON",
+            "ORG",
+            "GPE",
+            "EMAIL",
+            "PHONE",
+            "SSN",
+            "CREDIT_CARD",
+            "DATE",
+            "POSTAL_CODE",
+            "ADDRESS",
+        ],
+    },
 }
 
-SYSTEM_PROMPT = (
-    "You are a helpful codebase assistant. Answer the user's question using ONLY the provided context. "
-    "If the context is insufficient, say so and suggest where to look in the code. "
-    "Cite your sources inline as [file.py:start-end]. Keep answers concise and actionable."
-)
+SYSTEM_PROMPT = """
+You are a helpful corpus assistant.
+
+Answer the user's question using only the supplied Context snippets. Do not use outside knowledge.
+
+If the Context is insufficient or conflicting, reply 'Insufficient context' and suggest specific places to look in this corpus (file paths, document titles, pages/sections) and refined queries or ingestion steps.
+
+Cite sources inline as [source:locator] using the bracketed labels shown in Context (e.g., [src/service.py:88-121], [contracts/msa.pdf:p12]). If no locator is shown, cite as [source].
+
+Keep answers concise and actionable.
+"""
 PROMPT_TMPL = ChatPromptTemplate.from_messages(
     [
         ("system", SYSTEM_PROMPT),
@@ -130,12 +157,25 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     return cfg
 
 
-def _build_retriever(index_path: str, embedding_model: str, k: int):
-    """Open persisted Chroma and return a retriever. Uses matching embedding model for queries."""
+def _build_retriever(
+    index_path: str,
+    embedding_model: str,
+    k: int,
+    search_type: str = "similarity",
+    mmr_fetch_k: Optional[int] = None,
+    mmr_lambda: float = 0.5,
+):
+    """Open persisted Chroma and return a retriever. Supports MMR to reduce redundancy."""
     emb = HuggingFaceEmbeddings(model_name=embedding_model)
     vs = Chroma(
         persist_directory=index_path, embedding_function=emb, collection_name="codeqa"
     )
+    if search_type == "mmr":
+        kwargs = {"k": k}
+        if mmr_fetch_k is None:
+            mmr_fetch_k = max(10, k * 4)
+        kwargs.update({"fetch_k": mmr_fetch_k, "lambda_multiplier": mmr_lambda})
+        return vs.as_retriever(search_type="mmr", search_kwargs=kwargs)
     return vs.as_retriever(search_kwargs={"k": k})
 
 
@@ -163,6 +203,112 @@ def _build_llm(model_name: str, temperature: float = 0.0):
     return ChatOpenAI(model=model_name, temperature=temperature)
 
 
+def _extract_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract key settings from the merged config.
+
+    Returns a flat dict so the call site stays concise.
+    """
+    k = int(cfg["retrieval"].get("k", 8))
+    mmr_fetch_k_default = max(10, k * 4)
+    return {
+        "index_path": str(cfg["index_path"]),
+        "embedding_model": str(cfg["model"]["embedding"]),
+        "chat_model": str(cfg["model"].get("chat", "gpt-4o-mini")),
+        "temperature": float(cfg["model"].get("temperature", 0.0)),
+        "k": k,
+        "max_context_chunks": int(cfg["retrieval"].get("max_context_chunks", 6)),
+        "max_chunk_chars": int(cfg["retrieval"].get("max_chunk_chars", 1200)),
+        "search_type": str(cfg["retrieval"].get("search_type", "similarity")),
+        "mmr_fetch_k": int(cfg["retrieval"].get("mmr_fetch_k", mmr_fetch_k_default)),
+        "mmr_lambda": float(cfg["retrieval"].get("mmr_lambda", 0.5)),
+        "use_openai_api": bool(cfg.get("app", {}).get("use_openai_api", False)),
+        "privacy_request_time": bool(cfg.get("privacy", {}).get("request_time", True)),
+        "privacy_enable_regex": bool(cfg.get("privacy", {}).get("enable_regex", True)),
+        "privacy_enable_ner": bool(cfg.get("privacy", {}).get("enable_ner", False)),
+        "privacy_entity_types": set(cfg.get("privacy", {}).get("entity_types", [])),
+    }
+
+
+def _retrieve_docs(retriever: Any, question: str, max_context_chunks: int) -> List[Any]:
+    docs = retriever.invoke(question)
+    return docs[:max_context_chunks]
+
+
+def _build_context_and_question(
+    docs: List[Any],
+    question: str,
+    *,
+    privacy_request_time: bool,
+    privacy_enable_regex: bool,
+    privacy_enable_ner: bool,
+    privacy_entity_types: Any,
+    max_chunk_chars: int,
+):
+    """Return (context, question_scrubbed, pseudonymizer_or_None)."""
+    if privacy_request_time:
+        base_texts = [getattr(d, "page_content", "") or "" for d in docs]
+        p = build_request_pseudonymizer(
+            texts=base_texts + [question],
+            enable_regex=privacy_enable_regex,
+            enable_ner=privacy_enable_ner,
+            entity_types=privacy_entity_types,
+        )
+        question_scrubbed = p.apply(question)
+        parts: List[str] = []
+        for d in docs:
+            src = d.metadata.get("source", "?")
+            loc = d.metadata.get("loc", "?")
+            txt = p.apply((d.page_content or "").strip())
+            if len(txt) > max_chunk_chars:
+                txt = txt[: max_chunk_chars - 3] + "..."
+            parts.append(f"[{src}:{loc}]\n{txt}")
+        context = "\n\n".join(parts)
+        return context, question_scrubbed, p
+    else:
+        context = _format_context(docs, max_chunk_chars=max_chunk_chars)
+        return context, question, None
+
+
+def _make_full_prompt(question_scrubbed: str, context: str) -> str:
+    return (
+        f"{SYSTEM_PROMPT}\n\nQuestion: {question_scrubbed}\n\nContext:\n{context}\n\nAnswer:"
+    )
+
+
+def _print_pre_call_estimate(full_prompt: str, model_name: str, max_output_tokens: int = 512) -> None:
+    try:
+        print(estimate_and_format(full_prompt, model_name, max_output_tokens))
+    except Exception:
+        pass
+
+
+def _invoke_llm(question_scrubbed: str, context: str, model_name: str, temperature: float):
+    msg = PROMPT_TMPL.invoke({"question": question_scrubbed, "context": context})
+    llm = _build_llm(model_name, temperature=temperature)
+    return llm.invoke(msg.to_messages())
+
+
+def _print_post_call_cost(full_prompt: str, output_text: str, model_name: str) -> None:
+    try:
+        prompt_tokens = count_tokens(full_prompt, model_name)
+        output_tokens = count_tokens(output_text, model_name)
+        final_cost = estimate_cost_usd(prompt_tokens, output_tokens, model_name)
+        print(
+            f"[TokenEstimate] actual_output_tokens={output_tokens} final_cost_usd~{final_cost:.6f}"
+        )
+    except Exception:
+        pass
+
+
+def _maybe_decode(answer: str, pseudonymizer: Optional[Any]):
+    if pseudonymizer is None:
+        return answer
+    try:
+        return pseudonymizer.decode(answer)
+    except Exception:
+        return answer
+
+
 def ask(question: str, config_path: Optional[str] = None) -> str:
     """Answer a question using the local Chroma index.
 
@@ -171,57 +317,55 @@ def ask(question: str, config_path: Optional[str] = None) -> str:
         print(ask("Where is update_particle_state used?"))
     """
     cfg = load_config(config_path)
-    index_path: str = cfg["index_path"]
-    embedding_model: str = cfg["model"]["embedding"]
-    chat_model: str = cfg["model"].get("chat", "gpt-4o-mini")
-    temperature: float = float(cfg["model"].get("temperature", 0.0))
+    s = _extract_settings(cfg)
 
-    k: int = int(cfg["retrieval"].get("k", 8))
-    max_context_chunks: int = int(cfg["retrieval"].get("max_context_chunks", 6))
-    max_chunk_chars: int = int(cfg["retrieval"].get("max_chunk_chars", 1200))
-
-    use_openai_api: bool = bool(cfg.get("app", {}).get("use_openai_api", False))
-
-    retriever = _build_retriever(index_path, embedding_model, k)
-    docs = retriever.invoke(question)[:max_context_chunks]
+    retriever = _build_retriever(
+        s["index_path"],
+        s["embedding_model"],
+        s["k"],
+        search_type=s["search_type"],
+        mmr_fetch_k=s["mmr_fetch_k"],
+        mmr_lambda=s["mmr_lambda"],
+    )
+    docs = _retrieve_docs(retriever, question, s["max_context_chunks"])
     if not docs:
         return "I couldn't find relevant context in the index. Try re-ingesting or broadening your query."
 
-    context = _format_context(docs, max_chunk_chars=max_chunk_chars)
-    # Debug: print the constructed prompt for copy-paste into ChatGPT web
-    full_prompt = (
-        f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nContext:\n{context}\n\nAnswer:"
+    context, question_scrubbed, p = _build_context_and_question(
+        docs,
+        question,
+        privacy_request_time=s["privacy_request_time"],
+        privacy_enable_regex=s["privacy_enable_regex"],
+        privacy_enable_ner=s["privacy_enable_ner"],
+        privacy_entity_types=s["privacy_entity_types"],
+        max_chunk_chars=s["max_chunk_chars"],
     )
+    # Debug: print the constructed prompt for copy-paste into ChatGPT web
+    full_prompt = _make_full_prompt(question_scrubbed, context)
     print("\n--- Copy this into ChatGPT ---\n")
     print(full_prompt)
 
     # Rough, pre-call estimate (replace model/rates in cost_estimator.py to be accurate)
-    model_name = cfg["model"].get("chat", "gpt-4o-mini")
+    model_name = s["chat_model"]
     max_output_tokens = 512  # adjust to your cap
-    print(estimate_and_format(full_prompt, model_name, max_output_tokens))
+    _print_pre_call_estimate(full_prompt, model_name, max_output_tokens)
 
-    if not use_openai_api:
+    if not s["use_openai_api"]:
         # print-and-copy debug mode (no API calls)
         return ""
 
     # Build and call the LLM
-    msg = PROMPT_TMPL.invoke({"question": question, "context": context})
-    llm = _build_llm(chat_model, temperature=temperature)
-    res = llm.invoke(msg.to_messages())
+    res = _invoke_llm(
+        question_scrubbed, context, s["chat_model"], temperature=s["temperature"]
+    )
 
     # Optional: refine with actual output tokens
-    try:
-        output_tokens = count_tokens(getattr(res, "content", str(res)), model_name)
-        final_cost = estimate_cost_usd(
-            count_tokens(full_prompt, model_name), output_tokens, model_name
-        )
-        print(
-            f"[TokenEstimate] actual_output_tokens={output_tokens} final_cost_usd~{final_cost:.6f}"
-        )
-    except Exception:
-        pass
+    _print_post_call_cost(full_prompt, getattr(res, "content", str(res)), model_name)
 
-    return getattr(res, "content", str(res))
+    answer = getattr(res, "content", str(res))
+    # Decode the answer back to original values if pseudonymized
+    answer = _maybe_decode(answer, p)
+    return answer
 
 
 if __name__ == "__main__":
