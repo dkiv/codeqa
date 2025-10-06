@@ -32,6 +32,10 @@ pip install -r requirements.txt
 
 # (Optional) create .env from template
 cp .env.example .env
+ 
+# (Optional, for NER) install a spaCy model
+# Only needed if you set privacy.enable_ner: true in config.yaml
+python -m spacy download en_core_web_sm
 ```
 
 Docker (alternative):
@@ -91,8 +95,14 @@ docker build -t codeqa .
 
 ### Privacy: Request-time Pseudonymization
 - Enabled by default via `privacy.request_time: true` in `config.yaml`.
-- Replaces entities (PERSON/ORG/GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, ADDRESS) with placeholders like `Person_1` before calling the LLM. The final answer is decoded back locally.
-- Optional NER: set `privacy.enable_ner: true` if you have spaCy and a model (e.g., `en_core_web_sm`) installed. The Docker image includes `en_core_web_sm` by default. Without spaCy, regex-based detection still scrubs structured PII.
+- Replaces entities (PERSON/ORG/GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, POSTAL_CODE, ADDRESS) with placeholders like `Person_1` before calling the LLM. The final answer is decoded back locally.
+- Regex toggle: `privacy.enable_regex: true|false` controls structured PII scrubbing (EMAIL/PHONE/SSN/CREDIT_CARD/DATE/POSTAL_CODE/ADDRESS). Disable if you want to see raw values or to isolate regex effects during debugging.
+- Optional NER: set `privacy.enable_ner: true` if you have spaCy and a model (e.g., `en_core_web_sm`) installed. If you are not using Docker, install the model with:
+  ```bash
+  python -m spacy download en_core_web_sm
+  ```
+  You can override the model via `SPACY_MODEL` env var. The Docker image installs `${SPACY_MODEL}` during build (default `en_core_web_sm`).
+- When `privacy.enable_ner: true` and spaCy or the configured model is missing, the app raises an error with install instructions.
 - Note: This does not modify embeddings or the stored index. For ingest-time pseudonymization (stronger privacy at the vector layer), add a separate flow and a stable mapping.
 
 3. **Estimate cost**

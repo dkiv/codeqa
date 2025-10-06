@@ -47,8 +47,16 @@ _DATE_TEXTUAL_RE = re.compile(
     re.IGNORECASE,
 )
 _CREDIT_CARD_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+_POSTAL_CA_RE = re.compile(
+    r"\b[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z][ -]?\d[ABCEGHJ-NPRSTV-Z]\d\b",
+    re.IGNORECASE,
+)
+_ZIP_US_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
 _ADDRESS_RE = re.compile(
-    r"\b\d{1,6}\s+(?:[A-Za-z0-9\.\-]+\s+){1,4}(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Pl|Place)\b",
+    r"\b\d{1,6}\s+(?:[A-Za-z0-9\.\-]+\s+){1,6}"
+    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Lane|Ln|Drive|Dr|Court|Ct|Way|Pl|Place)"
+    r"(?:\s+(?:N|S|E|W|North|South|East|West))?"
+    r"(?:[\s,]+(?:Suite|Ste|Unit|Apt|Apartment|#)\s*[A-Za-z0-9\-]+)?\b",
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"\bhttps?://[^\s>\]]+\b", re.IGNORECASE)
@@ -77,6 +85,8 @@ STRUCTURED_PATTERNS: Dict[str, re.Pattern] = {
     "DATE": _DATE_NUMERIC_RE,
     "DATE_TEXT": _DATE_TEXTUAL_RE,  # treated as DATE type
     "CREDIT_CARD": _CREDIT_CARD_RE,
+    "POSTAL_CODE_CA": _POSTAL_CA_RE,
+    "POSTAL_CODE_US": _ZIP_US_RE,
     "ADDRESS": _ADDRESS_RE,
     "URL": _URL_RE,  # not strictly PII, but may be sensitive
 }
@@ -91,6 +101,7 @@ DEFAULT_ENTITY_TYPES: Set[str] = {
     "SSN",
     "CREDIT_CARD",
     "DATE",
+    "POSTAL_CODE",
     "ADDRESS",
 }
 
@@ -98,6 +109,7 @@ DEFAULT_ENTITY_TYPES: Set[str] = {
 @dataclass
 class PrivacyConfig:
     request_time: bool = True
+    enable_regex: bool = True
     enable_ner: bool = False
     entity_types: Set[str] = field(default_factory=lambda: set(DEFAULT_ENTITY_TYPES))
 
@@ -118,10 +130,18 @@ class RequestPseudonymizer:
             return
         seen: List[Tuple[str, str]] = []  # (value, label)
         for t in texts:
-            for val, label in self._detect_structured(t):
-                if label not in self.config.entity_types:
-                    continue
-                seen.append((val, label if label != "DATE_TEXT" else "DATE"))
+            if self.config.enable_regex:
+                for val, label in self._detect_structured(t):
+                    # Normalize label variants
+                    if label == "DATE_TEXT":
+                        norm_label = "DATE"
+                    elif label.startswith("POSTAL_CODE"):
+                        norm_label = "POSTAL_CODE"
+                    else:
+                        norm_label = label
+                    if norm_label not in self.config.entity_types:
+                        continue
+                    seen.append((val, norm_label))
             if self.config.enable_ner:
                 for val, label in self._detect_ner(t):
                     if label in self.config.entity_types:
@@ -221,10 +241,32 @@ class RequestPseudonymizer:
 
 def build_request_pseudonymizer(
     texts: Sequence[str],
+    enable_regex: bool = True,
     enable_ner: bool = False,
     entity_types: Optional[Set[str]] = None,
 ) -> RequestPseudonymizer:
-    cfg = PrivacyConfig(request_time=True, enable_ner=enable_ner, entity_types=set(entity_types or DEFAULT_ENTITY_TYPES))
+    cfg = PrivacyConfig(
+        request_time=True,
+        enable_regex=enable_regex,
+        enable_ner=enable_ner,
+        entity_types=set(entity_types or DEFAULT_ENTITY_TYPES),
+    )
+    if cfg.enable_ner:
+        # Enforce spaCy availability when NER is requested
+        if spacy is None:
+            raise RuntimeError(
+                "privacy.enable_ner=true but spaCy is not installed. Install it (pip install spacy) and a model (e.g., en_core_web_sm)."
+            )
+        import os
+        model_name = os.getenv("SPACY_MODEL", "en_core_web_sm")
+        global _NLP
+        if _NLP is None:
+            try:
+                _NLP = spacy.load(model_name)
+            except Exception as e:
+                raise RuntimeError(
+                    f"privacy.enable_ner=true but spaCy model '{model_name}' is not available. Install it via: python -m spacy download {model_name}"
+                ) from e
     p = RequestPseudonymizer(cfg)
     p.build_mapping(texts)
     return p

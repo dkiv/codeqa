@@ -46,13 +46,14 @@ retrieval:
 # (Otherwise, it will just print the prompt and exit.)
 # Note: this requires you to set OPENAI_API_KEY in your environment.
 app:
-  use_openai_api: True
+  use_openai_api: false
 
 # --- Privacy (request-time pseudonymization) ---
 privacy:
   request_time: true         # scrub retrieved context + question before LLM call
-  enable_ner: false          # if spaCy (and a model) is installed, set true to include PERSON/ORG/GPE
-  entity_types: [PERSON, ORG, GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, ADDRESS]
+  enable_regex: true         # use regex patterns for structured PII (EMAIL/PHONE/SSN/CREDIT_CARD/DATE/POSTAL_CODE/ADDRESS)
+  enable_ner: true          # if spaCy (and a model) is installed, set true to include PERSON/ORG/GPE
+  entity_types: [PERSON, ORG, GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, POSTAL_CODE, ADDRESS]
 
 # --- Ingest behavior ---
 # If true, remove the existing index directory before rebuilding to avoid duplicates
