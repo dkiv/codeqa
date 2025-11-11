@@ -60,6 +60,15 @@ Ask a question
 python rag_chain.py "Where is GeneticAlgorithmRunner used?"
 ```
 
+Web UI (Flask)
+```bash
+# Start a simple UI at http://localhost:5000
+python app.py
+```
+Notes:
+- By default, the chain prints a copy‑paste prompt and does not call an API.
+- To have the UI call OpenAI directly, set `app.use_openai_api: true` in `config.yaml` and define `OPENAI_API_KEY` (e.g., in `.env`).
+
 Enable OpenAI calls (optional)
 - By default, `rag_chain.py` prints a copy‑paste prompt and does not call an API.
 - To call OpenAI:

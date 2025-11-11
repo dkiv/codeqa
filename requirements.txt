@@ -12,3 +12,4 @@ docx2txt>=0.8
 pypdf>=4
 spacy>=3.7,<3.9
 sentence-transformers>=2.2.2
+Flask>=3.0

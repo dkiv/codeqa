@@ -20,7 +20,10 @@ from typing import Any, Dict, List, Optional
 
 import yaml  # type: ignore
 from dotenv import find_dotenv, load_dotenv
-from langchain.prompts import ChatPromptTemplate
+try:
+    from langchain_core.prompts import ChatPromptTemplate  # langchain>=0.1
+except Exception:  # pragma: no cover
+    from langchain.prompts import ChatPromptTemplate  # fallback for older versions
 from langchain_chroma import Chroma  # type: ignore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI  # type: ignore

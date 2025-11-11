@@ -31,7 +31,11 @@ try:  # optional loaders for PDFs and DOCX
 except Exception:  # pragma: no cover
     PyPDFLoader = None  # type: ignore
     Docx2txtLoader = None  # type: ignore
-from langchain.schema import Document as LCDocument  # type: ignore
+try:
+    from langchain_core.documents import Document as LCDocument  # langchain>=0.1
+except Exception:  # pragma: no cover
+    # Fallback for very old langchain versions
+    from langchain.schema import Document as LCDocument  # type: ignore
 from langchain_text_splitters import (  # type: ignore
     Language,
     RecursiveCharacterTextSplitter,
