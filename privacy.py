@@ -60,6 +60,10 @@ _ADDRESS_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"\bhttps?://[^\s>\]]+\b", re.IGNORECASE)
+_ORG_SUFFIX_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z&.'-]+(?:\s+[A-Z][A-Za-z&.'-]+){1,6})\s+"
+    r"(?:LLP|L\.L\.P\.|LLC|L\.L\.C\.|Inc\.?|Incorporated|Ltd\.?|Limited|Corp\.?|Corporation|P\.C\.|PC|S\.C\.|SC|Company|Co\.)\b"
+)
 
 
 def _luhn_ok(num: str) -> bool:
@@ -89,6 +93,8 @@ STRUCTURED_PATTERNS: Dict[str, re.Pattern] = {
     "POSTAL_CODE_US": _ZIP_US_RE,
     "ADDRESS": _ADDRESS_RE,
     "URL": _URL_RE,  # not strictly PII, but may be sensitive
+    # Heuristic: capture likely organization names with legal suffixes (e.g., law firms)
+    "ORG_SUFFIX": _ORG_SUFFIX_RE,
 }
 
 
@@ -103,6 +109,7 @@ DEFAULT_ENTITY_TYPES: Set[str] = {
     "DATE",
     "POSTAL_CODE",
     "ADDRESS",
+    "URL",  # include URLs by default so domains don’t leak orgs
 }
 
 
@@ -210,7 +217,22 @@ class RequestPseudonymizer:
                     # Reduce false positives using Luhn
                     if not _luhn_ok(s):
                         continue
-                items.append((s, label))
+                # Promote some structured subtypes to generic labels
+                if label == "DATE_TEXT":
+                    items.append((s, "DATE"))
+                elif label.startswith("POSTAL_CODE_"):
+                    # Normalize to POSTAL_CODE
+                    items.append((s, "POSTAL_CODE"))
+                    # Also map the trailing LDU (last 3 chars) to POSTAL_CODE as a fallback
+                    # so if another detector replaces the FSA prefix, the LDU still gets scrubbed.
+                    compact = s.replace(" ", "").replace("-", "")
+                    if len(compact) == 6:
+                        ldu = compact[-3:]
+                        items.append((ldu, "POSTAL_CODE"))
+                elif label == "ORG_SUFFIX":
+                    items.append((s, "ORG"))
+                else:
+                    items.append((s, label))
         return items
 
     def _detect_ner(self, text: str) -> List[Tuple[str, str]]:

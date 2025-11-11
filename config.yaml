@@ -53,7 +53,7 @@ privacy:
   request_time: true         # scrub retrieved context + question before LLM call
   enable_regex: true         # use regex patterns for structured PII (EMAIL/PHONE/SSN/CREDIT_CARD/DATE/POSTAL_CODE/ADDRESS)
   enable_ner: true          # if spaCy (and a model) is installed, set true to include PERSON/ORG/GPE
-  entity_types: [PERSON, ORG, GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, POSTAL_CODE, ADDRESS]
+  entity_types: [PERSON, ORG, GPE, EMAIL, PHONE, SSN, CREDIT_CARD, DATE, POSTAL_CODE, ADDRESS, URL]
 
 # --- Ingest behavior ---
 # If true, remove the existing index directory before rebuilding to avoid duplicates
